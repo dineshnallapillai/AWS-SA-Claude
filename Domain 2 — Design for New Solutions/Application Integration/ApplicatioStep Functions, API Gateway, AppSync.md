@@ -826,3 +826,262 @@ Question mentions...                                    → Think...
 - "Protect API from DDoS/SQL injection" → **API Gateway REST + WAF**
 - "Reduce Lambda glue in workflow" → **Step Functions direct SDK integration**
 - "API needs to access private backend (NLB)" → **API Gateway + VPC Link**
+
+---
+
+## 8. Deep Dive: 10 More Tricky Scenario-Based Questions
+
+**Q1:** A company uses API Gateway REST API with Lambda proxy integration. They enable caching with a 5-minute TTL. After deployment, authenticated users see other users' data. What went wrong?
+
+**A:** The cache key does not include user identity. By default, cache key = resource path + query string parameters. If the response is personalized per user, you must add the `Authorization` header (or a user-identifying header) to the cache key parameters. **Fix:** Configure cache key parameters to include the `Authorization` header OR disable caching for personalized endpoints. **Key trap:** API Gateway caching is NOT user-aware by default. Caching personalized responses without proper cache keys = data leakage security vulnerability.
+
+---
+
+**Q2:** A Step Functions workflow uses a Map state to process 50,000 items from S3. The execution fails with "States.DataLimitExceeded" error. What's wrong?
+
+**A:** The standard inline Map state passes all items through the state machine's payload, which is limited to **256 KB per state input/output**. 50,000 items exceeds this. **Fix:** Use **Distributed Map** mode — it reads items directly from S3 (no payload limit) and launches child executions (up to 10,000 concurrent). **Wrong answer:** "Increase the payload limit" — 256 KB is a hard limit. **Key distinction:** Inline Map = items in payload (256 KB limit). Distributed Map = items from S3 (millions of items).
+
+---
+
+**Q3:** A company exposes a REST API via API Gateway. They need to allow access only from their corporate VPN (specific IP range) AND require IAM authentication for AWS SDK clients. They configure a resource policy to allow the IP range, but IAM-authenticated clients outside the VPN are blocked. Why?
+
+**A:** For REST APIs, when BOTH a resource policy and IAM authentication are used, the request must satisfy **both** policies (AND logic for same-account). The resource policy denies requests from outside the IP range, so even valid IAM credentials are rejected. **Fix:** (1) Modify resource policy to allow both the IP range AND IAM principals. (2) Use condition keys in the resource policy that permit IAM-authenticated callers regardless of IP. **Key rule:** Resource policy + IAM auth = both must explicitly ALLOW (implicit deny in resource policy blocks IAM callers).
+
+---
+
+**Q4:** A team deploys an API Gateway HTTP API with a Cognito JWT authorizer. They test with a valid token and get `401 Unauthorized`. The same token works with the Cognito-hosted UI. What's likely wrong?
+
+**A:** Common causes: (1) The JWT `aud` (audience) claim doesn't match the configured audience in the authorizer. HTTP API JWT authorizers require the token's `aud` to match. (2) The `iss` (issuer) URL doesn't match exactly (must include the full Cognito User Pool URL with region). (3) Token is expired. **Key difference:** REST API Cognito authorizer validates tokens automatically. HTTP API JWT authorizer requires explicit `audience` and `issuer` configuration — mismatches silently fail with 401.
+
+---
+
+**Q5:** A Step Functions Standard Workflow calls a third-party API via an HTTP Task (using API Gateway as the target). The API occasionally takes 45 seconds to respond. The workflow times out. How should this be redesigned?
+
+**A:** Don't call the third-party API synchronously through API Gateway (29s hard limit). **Options:** (1) Use Step Functions **HTTP Task** (direct HTTPS endpoint invocation — supports up to the state's TimeoutSeconds, not limited to 29s). (2) Use `.waitForTaskToken` pattern: invoke Lambda that starts the API call, Lambda returns immediately, third-party sends callback with task token when done. (3) Use Lambda with SDK directly (Lambda timeout up to 15 min). **Key nuance:** Step Functions can make direct HTTP calls (HTTPS endpoints) without API Gateway, avoiding the 29s limit. But the task itself still needs `TimeoutSeconds` and `HeartbeatSeconds` configured.
+
+---
+
+**Q6:** An AppSync API uses a DynamoDB resolver to fetch a list of orders. Each order has a `customerId` field, and the client also wants customer details. The naive implementation causes N+1 queries (one query for orders, then one query per customer). How to fix this?
+
+**A:** Use **AppSync Batch Resolvers**. Configure the customer resolver to use `BatchGetItem` — AppSync automatically batches individual resolver calls into a single batch DynamoDB request. Set `maxBatchSize` on the resolver. **Alternative:** Use a Pipeline Resolver that fetches orders first, extracts unique customerIds, then batch-fetches all customers in one DynamoDB call. **Key concept:** AppSync batch resolvers solve N+1 automatically by grouping individual field resolutions into batch operations.
+
+---
+
+**Q7:** A company uses API Gateway with a Lambda function. During a traffic spike, some requests get 502 errors. CloudWatch shows Lambda throttling errors. API Gateway has no throttling configured. What's the fix?
+
+**A:** Lambda is hitting its **concurrency limit** (account default: 1,000 concurrent executions). API Gateway retries throttled Lambda invocations but eventually returns 502 after retries exhaust. **Fixes:** (1) Request Lambda concurrency limit increase. (2) Configure **Provisioned Concurrency** on Lambda for predictable baseline. (3) Set API Gateway **throttle limits** to keep request rate within Lambda's capacity (prevents overwhelming Lambda). (4) Use SQS between API Gateway and Lambda for buffering. **Key trap:** 502 from API Gateway often means the backend (Lambda) failed, not that API Gateway itself has a problem. Check Lambda metrics first.
+
+---
+
+**Q8:** A workflow needs to process items from a DynamoDB table. A developer implements: Lambda → Scan DynamoDB → Pass items to Step Functions Map state. For 10 million items, this fails. What's the architectural issue?
+
+**A:** Multiple problems: (1) Lambda has 15-min timeout — scanning 10M items may exceed it. (2) Lambda payload return limit is 6 MB — 10M items won't fit. (3) Step Functions Map state input is 256 KB max (inline). **Correct architecture:** Use Step Functions **Distributed Map** with a DynamoDB export to S3 as the item source. Or use DynamoDB export → S3 → Distributed Map. **Key learning:** For large-scale data processing, never pass millions of items through Step Functions state payloads. Use Distributed Map with S3 as the item reader.
+
+---
+
+**Q9:** A company has an API Gateway WebSocket API for a chat application. They store connection IDs in DynamoDB. When sending a message to a disconnected client, the POST to `@connections/{connectionId}` returns a 410 GoneException. What should the application do?
+
+**A:** The 410 response means the connection no longer exists. The application should: (1) Catch the 410 error. (2) Delete the stale connection ID from DynamoDB. (3) Continue sending to remaining connections. **Key design pattern:** WebSocket APIs require application-level connection lifecycle management. Always handle 410 GoneException by cleaning up stale connections. `$disconnect` route isn't guaranteed to fire (client may lose connectivity without clean disconnect).
+
+---
+
+**Q10:** A company uses Step Functions to orchestrate a payment workflow: Reserve Inventory → Charge Payment → Ship Order. The "Charge Payment" step succeeds, but "Ship Order" fails. The Catch block routes to a "Refund Payment" compensating action, but the refund also fails. What happens?
+
+**A:** If the compensating action (Refund) also fails and has no further Catch/Retry → the entire execution fails in the FAILED state. **Best practice:** Compensating transactions should have their OWN Retry configuration (with aggressive retries) and a final Catch that routes to a human intervention state (SNS notification, manual queue). **Architecture:** Refund Payment → Retry (MaxAttempts: 5, BackoffRate: 2) → Catch → "Alert Operations Team" (SNS + persist to DLQ). **Key concept:** Saga compensating actions must be as resilient as forward actions. Double failures need human escalation.
+
+---
+
+## 9. Service Comparison Tables
+
+### Step Functions Standard vs Express
+
+| Dimension | Standard | Express |
+|-----------|----------|---------|
+| **Use Case** | Long workflows, human approval, audit | High-volume event processing, IoT, streaming |
+| **Max Duration** | 1 year | 5 minutes |
+| **Delivery** | Exactly-once | At-least-once (async) / At-most-once (sync) |
+| **Start Rate** | 2,000/sec | 100,000/sec |
+| **Pricing** | $0.025 per 1,000 state transitions | ~$1/million executions + duration |
+| **History** | Full execution history (90 days) | CloudWatch Logs only |
+| **HA Model** | Durable state, Multi-AZ, survives AZ failure | Stateless, Multi-AZ |
+| **Exam Tip** | "audit trail", "exactly-once", "long-running" | "high volume", "short duration", "idempotent" |
+
+### API Gateway REST vs HTTP vs WebSocket
+
+| Dimension | REST API | HTTP API | WebSocket API |
+|-----------|----------|----------|---------------|
+| **Use Case** | Full-featured API management | Simple, cheap Lambda proxy | Real-time bidirectional |
+| **Latency** | ~50ms overhead | ~10ms overhead | Persistent (no overhead per msg) |
+| **Pricing** | $3.50/million | $1.00/million | $1.00/million msgs + connection mins |
+| **Caching** | Yes | No | No |
+| **WAF** | Yes | No | Yes |
+| **API Keys/Plans** | Yes | No | No |
+| **VPC Link Backend** | NLB only | ALB, NLB, Cloud Map | No |
+| **HA Model** | Multi-AZ, edge-optimized option | Multi-AZ | Multi-AZ |
+| **Exam Tip** | "caching", "WAF", "API keys", "validation" | "cheapest", "lowest latency", "simple proxy" | "chat", "real-time", "persistent connection" |
+
+### API Gateway vs AppSync
+
+| Dimension | API Gateway | AppSync |
+|-----------|-------------|---------|
+| **Use Case** | REST/HTTP APIs, microservice proxy | GraphQL, real-time, multi-source aggregation |
+| **Protocol** | REST, HTTP, WebSocket | GraphQL (HTTP + WebSocket) |
+| **Real-Time** | WebSocket (manual management) | Subscriptions (fully managed) |
+| **Caching** | REST only (stage-level) | Resolver-level |
+| **Offline** | No | Yes (Amplify DataStore) |
+| **Data Sources** | Backend (Lambda, HTTP, AWS services) | DynamoDB, RDS, OpenSearch, Lambda, HTTP (direct) |
+| **Auth** | IAM, Cognito, Lambda authorizer, API keys | IAM, Cognito, OIDC, Lambda, API Key (multi-mode) |
+| **Pricing** | $1.00-$3.50/million | $4.00/million |
+| **HA Model** | Multi-AZ, multi-region with Route 53 | Multi-AZ, multi-region with Route 53 |
+| **Exam Tip** | "REST", "throttle clients", "WAF" | "GraphQL", "offline", "real-time subscriptions", "multiple data sources" |
+
+### Step Functions vs EventBridge for Orchestration/Coordination
+
+| Dimension | Step Functions | EventBridge |
+|-----------|---------------|-------------|
+| **Model** | Sequential/parallel state machine | Event-driven routing |
+| **Flow Control** | Explicit (Choice, Parallel, Map, Wait) | Rules match events → fire targets |
+| **Error Handling** | Retry/Catch built-in | Retry policy + DLQ |
+| **Long-Running** | Yes (1 year) | No (immediate delivery) |
+| **Human Interaction** | waitForTaskToken | No native support |
+| **Exam Tip** | "coordinate steps", "compensating actions", "orchestrate" | "react to events", "route based on content" |
+
+---
+
+## 10. When to Pick Service A over Service B — Exam Keywords
+
+### Pick Step Functions over Lambda-to-Lambda chaining when:
+- "coordinate", "orchestrate" multiple services
+- "error handling", "retry with backoff"
+- "compensating transaction", "saga pattern"
+- "wait for human approval", "callback"
+- "visual workflow", "audit trail"
+- "parallel processing of branches"
+- **Exam signal:** Any multi-step workflow with branching/error logic
+
+### Pick API Gateway REST over HTTP API when:
+- "caching" (only REST has it)
+- "WAF protection" (only REST supports it)
+- "API keys", "usage plans", "throttle per client"
+- "request validation" (reject bad input before Lambda)
+- "request/response transformation" (Velocity templates)
+- "resource policy" (IP restriction, cross-account)
+- "private API" (both support, but REST has resource policies)
+- **Exam signal:** Any advanced API management feature
+
+### Pick HTTP API over REST API when:
+- "cost", "cheapest", "lowest cost"
+- "low latency", "minimal overhead"
+- "simple proxy" to Lambda or HTTP backend
+- "JWT/OIDC auth" is sufficient (no Cognito User Pools native needed)
+- "no need for caching, WAF, or API keys"
+- **Exam signal:** Simple use case + cost optimization
+
+### Pick AppSync over API Gateway when:
+- "GraphQL"
+- "real-time subscriptions" (managed fan-out to clients)
+- "offline mobile application"
+- "multiple data sources in one query"
+- "reduce over-fetching" (client specifies fields)
+- "conflict resolution" (offline sync)
+- **Exam signal:** Mobile/web app with real-time + offline needs
+
+### Pick API Gateway WebSocket over AppSync when:
+- "custom protocol over WebSocket"
+- "server-initiated messages to specific clients" (not broadcast)
+- "existing WebSocket infrastructure migration"
+- "fine-grained per-connection routing"
+- **Exam signal:** Custom bidirectional protocol, not standard pub/sub
+
+### Pick Step Functions Express over Standard when:
+- "high volume" (>2,000 executions/sec)
+- "short duration" (<5 minutes)
+- "cost-sensitive" + high volume
+- "idempotent processing" is already in place
+- "IoT event processing", "streaming event enrichment"
+- **Exam signal:** Volume + short duration + cost
+
+### Pick Step Functions Standard over Express when:
+- "exactly-once" semantics required
+- "long-running" (>5 minutes)
+- "audit trail", "execution history"
+- "human approval", "wait days"
+- "must not duplicate operations" (financial transactions)
+- **Exam signal:** Duration + exactly-once + audit
+
+---
+
+## 11. "Gotcha" Differences the Exam Tests
+
+### API Gateway Gotchas
+1. **29-second integration timeout is HARD.** Cannot be changed, not even with support request. Any question with >29s backend → async pattern.
+2. **REST API resource policies + IAM auth = AND logic (same account).** Both must allow. Cross-account = AND with explicit Allow required in both.
+3. **HTTP API lacks WAF.** If the question mentions WAF + cheapest → REST API (you can't use HTTP API with WAF).
+4. **Edge-optimized creates a hidden CloudFront distribution.** You can't customize it. For custom CloudFront config → use Regional + your own CloudFront.
+5. **API Gateway throttle is account-wide (10k RPS).** Not per-API. One API at 8k RPS leaves only 2k for all other APIs.
+6. **Lambda authorizer caching uses the token/identity source as cache key.** Different tokens = cache miss. Same token = cache hit (won't re-invoke authorizer).
+7. **VPC Link for REST = NLB only.** For HTTP API = ALB, NLB, or Cloud Map. If question says "ALB backend" + "API Gateway" → HTTP API with VPC Link.
+8. **API Gateway payload limit = 10 MB.** Lambda payload limit = 6 MB (synchronous). If API GW → Lambda → response > 6 MB → Lambda fails, not API GW.
+9. **Canary deployments are per-stage.** You promote a canary by updating the stage, not by creating a new stage.
+10. **Custom domain names with edge-optimized APIs:** Certificate MUST be in us-east-1. Regional APIs: certificate in same region.
+
+### Step Functions Gotchas
+11. **256 KB state input/output limit.** Don't pass large datasets through state machine payload. Use S3 references instead.
+12. **25,000 history events per execution (Standard).** Very long workflows with many iterations may hit this — use child executions or Distributed Map.
+13. **Standard Workflows charge per state transition.** Even Pass states and Choice states count. Minimize unnecessary states.
+14. **Express Workflows have NO execution history API.** Only CloudWatch Logs. Can't query past execution details programmatically like Standard.
+15. **`.sync` integration waits for the resource.** Without `.sync`, Step Functions fires and moves on immediately. Common mistake: using Lambda without `.sync` and expecting the result.
+16. **Wait state counts as one transition (entering it).** A 1-year Wait state = cheap (1 transition at start, 1 at end).
+17. **`States.ALL` in Catch must be LAST.** More specific error matches must come before `States.ALL` or they'll never match.
+18. **Activity tasks require polling.** Step Functions doesn't push work — workers must call `GetActivityTask`. If no worker polls within heartbeat timeout → `States.HeartbeatTimeout`.
+
+### AppSync Gotchas
+19. **AppSync subscriptions are triggered by MUTATIONS, not direct database changes.** If data changes via direct DynamoDB write (not through AppSync mutation) → no subscription fires.
+20. **Multiple auth modes require directives on schema.** Without directives, the default auth mode applies to all fields. Adding a second mode without annotating fields = security gap.
+21. **AppSync resolvers timeout at 30 seconds** (vs API Gateway's 29s). Not much difference, but it's a distinct limit.
+22. **Pipeline resolvers share a 30-second total timeout.** All functions in the pipeline must complete within 30s combined, not 30s each.
+23. **AppSync caching is resolver-level, not response-level.** Different resolvers in the same query can have different cache configs.
+24. **Subscription filters are server-side.** Clients don't download all data and filter locally — AppSync filters before sending, saving bandwidth.
+
+---
+
+## 12. Decision Tree: Choosing the Right API/Orchestration Service
+
+```
+START: What is the primary need?
+│
+├─── Need to EXPOSE an API to clients?
+│    ├─── GraphQL with multiple data sources? → AppSync
+│    │    ├─── Need offline sync? → AppSync + Amplify DataStore
+│    │    └─── Need real-time push to clients? → AppSync Subscriptions
+│    ├─── REST API with advanced management?
+│    │    ├─── Need caching? → REST API
+│    │    ├─── Need WAF? → REST API
+│    │    ├─── Need API keys/usage plans? → REST API
+│    │    └─── Need request validation? → REST API
+│    ├─── Simple REST/HTTP proxy (cost priority)? → HTTP API
+│    └─── Bidirectional real-time? → WebSocket API or AppSync
+│
+├─── Need to ORCHESTRATE multi-step workflows?
+│    ├─── Long-running (>5 min)? → Step Functions Standard
+│    ├─── Need exactly-once? → Step Functions Standard
+│    ├─── High-volume, short (<5 min)? → Step Functions Express
+│    ├─── Need human approval/callback? → Step Functions + waitForTaskToken
+│    └─── Saga/compensation needed? → Step Functions (Retry + Catch)
+│
+├─── Backend takes LONGER THAN 29 SECONDS?
+│    └─── Async pattern: API GW → SQS/Step Functions → Callback/Poll
+│
+├─── Need to access PRIVATE backend from API?
+│    ├─── Backend behind NLB? → REST API + VPC Link
+│    ├─── Backend behind ALB? → HTTP API + VPC Link
+│    └─── API only accessible from VPC? → Private API + VPC Endpoint
+│
+├─── Need REAL-TIME push to many clients?
+│    ├─── Pub/sub fan-out to millions? → AppSync Subscriptions
+│    ├─── Custom per-connection logic? → WebSocket API
+│    └─── Simple notification? → SNS → mobile push
+│
+└─── Need to MINIMIZE custom code in orchestration?
+     └─── Step Functions direct SDK integrations (200+ services)
+```
