@@ -602,3 +602,238 @@ Question mentions...                           → Think...
 - "Guaranteed no message loss with multiple consumers" → **SNS + SQS**
 - "Process failed messages later" → **Dead-Letter Queue**
 - "Cross-account event aggregation" → **EventBridge cross-account**
+
+---
+
+## 8. Deep Dive: 10 More Tricky Scenario-Based Questions
+
+**Q1:** A company uses SNS to deliver messages to an SQS queue in another account. Messages are encrypted with a customer-managed KMS key (CMK) in the SNS account. The SQS queue in the target account cannot decrypt the messages. What's wrong?
+
+**A:** The KMS key policy in the SNS account must grant `kms:Decrypt` and `kms:GenerateDataKey` to the SQS service principal in the target account. Additionally, the SQS queue's KMS key (if encrypted) must allow SNS to generate data keys. **Key trap:** Cross-account encrypted messaging requires KMS key policies in BOTH accounts to allow the respective services. Simply sharing the SNS topic isn't enough when KMS is involved.
+
+---
+
+**Q2:** An application sends 5,000 messages/sec to an SQS FIFO queue using a single Message Group ID. The queue processes messages slowly and a backlog builds. Adding more consumers doesn't help. Why?
+
+**A:** With a single Message Group ID, all messages must be processed **sequentially by one consumer** (FIFO ordering guarantee). Additional consumers are idle because only one consumer can process messages from a single message group at a time. **Fix:** Redesign to use multiple Message Group IDs (e.g., per customer, per category) to enable parallel processing while maintaining order within each group. **Key concept:** Parallelism in FIFO = number of unique Message Group IDs, NOT number of consumers.
+
+---
+
+**Q3:** A team configures S3 event notifications to send to both an SNS topic and an SQS queue for the same event type (`s3:ObjectCreated:*`) on the same prefix. Configuration fails. Why?
+
+**A:** S3 event notification configuration does NOT allow the same combination of event type + prefix + suffix to be sent to multiple destinations. **Fix:** (1) Send to SNS topic, then fan out to SQS + other consumers. (2) Enable EventBridge on the bucket (all S3 events go to EventBridge), then create multiple rules. (3) Use different prefix/suffix filters for each destination. **Key rule:** One event type + prefix + suffix combination = one destination in S3 bucket notification config.
+
+---
+
+**Q4:** A company uses EventBridge to trigger a Lambda function when an IAM policy is changed. The rule works in the us-east-1 region but not in eu-west-1 where the company operates. Why?
+
+**A:** IAM is a **global service** and its API calls are logged by CloudTrail only in **us-east-1**. Therefore, IAM events appear on the EventBridge default bus only in us-east-1. **Fix:** Create the rule in us-east-1, or configure cross-region event routing from us-east-1 to eu-west-1. **Key trap:** Global service events (IAM, STS, CloudFront) are only available in us-east-1 EventBridge.
+
+---
+
+**Q5:** An application sends messages to SQS with a Delay Queue set to 15 minutes. A consumer reads the message and sets the visibility timeout to 5 minutes. The consumer fails after 3 minutes. When will the message become visible again?
+
+**A:** The message becomes visible 5 minutes after it was received (not after failure). The delay queue only applies to the **initial delivery**. Once the message has been received, the visibility timeout governs reappearance. So the message reappears **2 minutes after the consumer fails** (5 min visibility timeout - 3 min processing = 2 min remaining). **Key distinction:** Delay Queue = initial wait before first visibility. Visibility Timeout = wait after each receive.
+
+---
+
+**Q6:** A company has an EventBridge rule that targets 5 Lambda functions. They need to add a 6th target. What are their options?
+
+**A:** EventBridge limits each rule to **5 targets**. Options: (1) Create a second rule with the same event pattern targeting the 6th Lambda. (2) Have one target be SNS or SQS, then fan out to additional consumers from there. (3) Target a Step Functions state machine that orchestrates all 6 Lambdas. **Key fact:** Multiple rules can match the same event — the event is delivered to all matching rules' targets. Duplicate rules with the same event pattern is perfectly valid.
+
+---
+
+**Q7:** A microservices architecture uses SNS topics for inter-service communication. During deployment of Service B, its SQS subscription is deleted and recreated. Messages published during the gap are lost. How do you prevent this?
+
+**A:** **Option 1:** Never delete the subscription — update the endpoint instead. **Option 2:** Use infrastructure as code (CloudFormation/CDK) to ensure subscription always exists. **Option 3:** Configure SNS delivery retry policy (but SNS only retries for active subscriptions, not deleted ones). **Best fix:** Ensure subscriptions are persistent resources managed via IaC, not recreated during deployments. **Key concept:** If a subscription doesn't exist, messages published during that window are permanently lost (SNS has no persistence).
+
+---
+
+**Q8:** A company uses SQS with Lambda event source mapping. The Lambda function processes batches of 10 messages. If one message in the batch fails, all 10 messages return to the queue and are reprocessed. How do they avoid reprocessing the 9 successful messages?
+
+**A:** Enable **Partial Batch Response** (`ReportBatchItemFailures`). Lambda returns only the failed message IDs in `batchItemFailures`. SQS only returns those specific messages to the queue; successfully processed messages are deleted. **Without this feature:** The entire batch fails or succeeds as a unit. **Key config:** Set `FunctionResponseTypes` to include `ReportBatchItemFailures` on the event source mapping.
+
+---
+
+**Q9:** An organization uses EventBridge with a custom event bus. Events from Account A must be processed by rules in Account B's custom event bus. Events are arriving at Account B's bus but no rules are matching. What's likely wrong?
+
+**A:** When events are forwarded cross-account, the **event `source` and `detail-type` fields are preserved**, but the rule in Account B must match the event pattern exactly as it arrives (including the original source). Check: (1) The rule's event pattern matches the incoming event structure. (2) The event isn't wrapped in an additional envelope. **Common mistake:** Rules expecting `source: "aws.events"` (the forwarding service) instead of the original source (e.g., `source: "custom.myapp"`). Cross-account forwarding preserves the original event structure.
+
+---
+
+**Q10:** A company uses SQS Standard queue with a Lambda consumer. They notice that `ApproximateAgeOfOldestMessage` is increasing steadily. The Lambda function is not erroring. What's happening?
+
+**A:** Possible causes: (1) **Lambda concurrency limit reached** — messages queue up because Lambda can't scale to meet demand. (2) **Batch window configured** — Lambda waits to fill batches before processing. (3) **Reserved concurrency set too low** for the Lambda function. (4) **Event source mapping disabled or throttled.** **Fix:** Check Lambda concurrent executions metric, increase reserved concurrency, or increase Lambda scaling configuration (MaximumConcurrency on SQS event source). **Key metric:** `ApproximateAgeOfOldestMessage` growing = consumers aren't keeping up, not necessarily errors.
+
+---
+
+## 9. Service Comparison Tables
+
+### SQS vs SNS vs EventBridge
+
+| Dimension | SQS | SNS | EventBridge |
+|-----------|-----|-----|-------------|
+| **Use Case** | Decouple, buffer, async processing | Fan-out notifications | Event routing, AWS service reactions |
+| **Max Message/Event Size** | 256 KB | 256 KB | 256 KB |
+| **Throughput Limit** | Unlimited (Standard), 70k/s (FIFO) | Soft limits (varies by region) | Soft limits (varies by region) |
+| **Pricing** | $0.40/million requests | $0.50/million publishes | $1.00/million custom events; AWS events FREE |
+| **HA Model** | Multi-AZ, regional | Multi-AZ, regional | Multi-AZ, regional + Global Endpoints |
+| **Ordering** | FIFO queues only | FIFO topics only | No guarantee |
+| **Exam Tip** | "decouple", "buffer", "exactly-once" | "fan-out", "multiple subscribers", "notify" | "AWS event", "cross-account", "content routing", "schedule" |
+
+### SQS Standard vs SQS FIFO
+
+| Dimension | Standard | FIFO |
+|-----------|----------|------|
+| **Use Case** | High throughput, duplicates OK | Ordered, exactly-once critical |
+| **Throughput** | Unlimited | 300/s (3,000 batched, 70k high-throughput) |
+| **Delivery** | At-least-once | Exactly-once |
+| **Ordering** | Best-effort | Strict per Message Group ID |
+| **Pricing** | $0.40/million | $0.50/million |
+| **HA Model** | Same (Multi-AZ) | Same (Multi-AZ) |
+| **Exam Tip** | "high volume", "order not critical" | "must not duplicate", "sequential", "financial" |
+
+### SNS Standard vs SNS FIFO
+
+| Dimension | Standard Topics | FIFO Topics |
+|-----------|----------------|-------------|
+| **Subscribers** | SQS, Lambda, HTTP, Email, SMS, Firehose | SQS FIFO only |
+| **Throughput** | Very high (soft limits) | 300/s (3,000 batched) |
+| **Ordering** | No | Yes (per Message Group ID) |
+| **Deduplication** | No | Yes (5-min window) |
+| **Exam Tip** | "fan-out to Lambda/HTTP/email" | "ordered fan-out to multiple FIFO queues" |
+
+### EventBridge vs SNS for Event Routing
+
+| Dimension | EventBridge | SNS |
+|-----------|-------------|-----|
+| **Filtering** | Rich content-based (body + attributes, nested JSON) | Attribute-based filter policies (simpler) |
+| **Targets** | 28+ AWS service targets + API Destinations | Protocol-based (SQS, Lambda, HTTP, email, SMS) |
+| **Cross-Account** | Native (event bus policies) | Requires cross-account subscription setup |
+| **Schema** | Schema Registry + Discovery | No |
+| **Replay** | Archive & Replay | No |
+| **Scheduling** | Yes (Scheduler) | No |
+| **Exam Tip** | "content routing", "third-party API", "AWS state change" | "simple fan-out", "email/SMS notification" |
+
+---
+
+## 10. When to Pick Service A over Service B — Exam Keywords
+
+### Pick SQS over SNS when:
+- "single consumer", "one processing application"
+- "buffer requests", "decouple producer from consumer"
+- "batch processing", "worker queue"
+- "retain messages", "process later"
+- "visibility timeout", "processing time varies"
+- "exactly-once processing" (FIFO)
+
+### Pick SNS over SQS when:
+- "multiple subscribers", "fan-out"
+- "notify", "alert", "email", "SMS"
+- "push-based delivery"
+- "different consumers need same message"
+- "real-time notification to mobile"
+
+### Pick EventBridge over SNS when:
+- "react to AWS service event" (EC2, S3, RDS state changes)
+- "content-based routing" (filter on event body content)
+- "cross-account event aggregation"
+- "third-party SaaS integration" (partner event bus)
+- "schedule", "cron job"
+- "archive events", "replay events"
+- "send to third-party API" (API Destinations)
+- "many different targets for one event"
+
+### Pick SNS over EventBridge when:
+- "simple notification" (email, SMS, mobile push)
+- "existing SNS infrastructure", "fan-out to SQS already set up"
+- "FIFO ordered fan-out" (SNS FIFO → SQS FIFO)
+- "extremely high throughput fanout" (SNS has higher soft limits)
+- Cost-sensitive (SNS = $0.50/million vs EventBridge = $1.00/million custom events)
+
+### Pick SQS FIFO over Kinesis Data Streams when:
+- "exactly-once" (SQS FIFO guarantees this; KDS is at-least-once)
+- "message-level acknowledgment" (SQS deletes per-message; KDS checkpoints per-shard)
+- "lower throughput, strict ordering" (<70k messages/sec)
+- "no need for replay" (don't need retention/replay capability)
+
+### Pick Kinesis Data Streams over SQS when:
+- "replay", "reprocess historical data"
+- "multiple consumers on same data" (Enhanced Fan-Out)
+- "real-time analytics" (Flink integration)
+- "very high throughput streaming" (unlimited with enough shards)
+- "time-based retention" (24h–365d)
+
+---
+
+## 11. "Gotcha" Differences the Exam Tests
+
+### SQS Gotchas
+1. **maxReceiveCount counts ALL receives, not just failures.** A message read 5 times (even if processed successfully 4 times but visibility timeout expired) hits DLQ.
+2. **SQS DLQ must be same type as source.** Standard → Standard, FIFO → FIFO. Cross-type is not allowed.
+3. **SQS FIFO queue name MUST end in `.fifo`.** This is enforced — you can't create one without the suffix.
+4. **Long polling returns immediately if messages exist.** WaitTimeSeconds only applies when the queue is empty.
+5. **In-flight message limit (120k Standard / 20k FIFO) is per-queue.** Exceeding this causes `OverLimit` errors.
+6. **Purging a queue takes up to 60 seconds.** Messages may still be visible briefly after purge.
+
+### SNS Gotchas
+7. **SNS FIFO topics ONLY support SQS FIFO subscribers.** Not Lambda, not HTTP, not email. If the question mentions Lambda + FIFO ordering → wrong.
+8. **SNS filter policy on message attributes by default.** Payload-based filtering must be explicitly enabled (newer feature).
+9. **SNS → SQS cross-account requires BOTH topic policy AND queue policy.** Missing either = delivery fails silently.
+10. **SNS message delivery is NOT guaranteed for HTTP endpoints.** If endpoint is down beyond retry policy → message lost (unless DLQ configured on subscription).
+11. **SNS raw message delivery:** By default, SNS wraps messages in JSON envelope. Enable "Raw Message Delivery" to pass payload as-is to SQS/HTTP.
+
+### EventBridge Gotchas
+12. **AWS service events are FREE. Custom events cost $1/million.** The exam may test whether you know the cost difference.
+13. **EventBridge rules execute independently.** If two rules match the same event, both fire — no deduplication between rules.
+14. **EventBridge Global Endpoints need Route 53 health checks.** Without health checks, failover doesn't work.
+15. **EventBridge Pipes sources are limited:** SQS, Kinesis, DynamoDB Streams, MSK, self-managed Kafka, MQ. Not SNS, not S3, not HTTP.
+16. **`PutEvents` supports up to 10 entries per API call** (not 10,000 — that's entries per second throughput, often confused).
+17. **Cross-account EventBridge:** The SENDER account creates the rule that forwards. The RECEIVER account sets the resource policy on its bus.
+
+### Cross-Service Gotchas
+18. **S3 → EventBridge must be explicitly enabled** per bucket. It's not automatic like S3 → default event bus.
+19. **DLQ configuration differs:** SQS DLQ = on source queue. SNS DLQ = on subscription. EventBridge DLQ = on target/rule.
+20. **Message size is 256 KB for ALL three services** — but they count differently (SQS counts in 64KB chunks for billing).
+
+---
+
+## 12. Decision Tree: Choosing the Right Messaging/Event Service
+
+```
+START: What is the primary need?
+│
+├─── Need to DECOUPLE producer from consumer?
+│    ├─── Single consumer processing? → SQS
+│    │    ├─── Need ordering? → SQS FIFO
+│    │    ├─── Need exactly-once? → SQS FIFO
+│    │    └─── High throughput, duplicates OK? → SQS Standard
+│    └─── Multiple consumers need same message? → SNS + SQS fan-out
+│
+├─── Need to REACT to an AWS service event?
+│    └─── EventBridge (free for AWS events)
+│         ├─── Need to route to multiple targets? → EventBridge rules
+│         ├─── Need cross-account? → EventBridge bus policy
+│         └─── Need to archive/replay? → EventBridge Archive
+│
+├─── Need to NOTIFY humans or systems?
+│    ├─── Email/SMS/Mobile push? → SNS
+│    ├─── Third-party HTTP API with auth? → EventBridge API Destinations
+│    └─── Webhook (simple HTTP)? → SNS HTTP subscription
+│
+├─── Need CONTENT-BASED ROUTING?
+│    ├─── Simple attribute filtering? → SNS filter policies
+│    └─── Rich body/nested JSON filtering? → EventBridge rules
+│
+├─── Need SCHEDULING?
+│    └─── EventBridge Scheduler (cron/rate)
+│
+├─── Need CROSS-ACCOUNT event aggregation?
+│    └─── EventBridge (central bus + org policy)
+│
+├─── Need ORDERED FAN-OUT?
+│    └─── SNS FIFO → SQS FIFO queues
+│
+└─── Need REAL-TIME STREAMING with replay?
+     └─── Kinesis Data Streams (not SQS, SNS, or EventBridge)
+```
